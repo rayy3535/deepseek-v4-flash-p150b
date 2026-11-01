@@ -1,0 +1,4 @@
+{
+  "arch": "DeepseekV4ForCausalLM",
+  "main_class": "deepseek_v4_flash_adapter:DeepseekV4ForCausalLM"
+}
