@@ -38,23 +38,23 @@ from models.autoports.deepseek_ai_deepseek_v4_flash_0731.tt.multichip_decoder im
 )
 
 CHECKPOINT_ENV = "DEEPSEEK_V4_FLASH_HF_MODEL"
-# Expert paging (all routed experts BFP4, a pool of this many per layer on device). Unset or "off" keeps the
-# all-resident selective BFP4 deployment. Not a DSV4_* variable: those are refused as policy overrides.
+# Expert paging (all routed experts BFP4, a pool of this many per layer on device; default DEFAULT_EXPERT_POOL).
+# "off" keeps the all-resident selective BFP2/BFP4 deployment (needs a build with ttnn.bfloat2_b). Not a DSV4_* variable: those are refused as policy overrides.
 EXPERT_POOL_ENV = "DEEPSEEK_V4_FLASH_EXPERT_POOL"
-# Directory of the packed routed-expert cache used with paging; unset or empty means no cache.
+# Directory of the packed routed-expert cache used with paging (default DEFAULT_EXPERT_CACHE); empty means no cache.
 EXPERT_CACHE_ENV = "DEEPSEEK_V4_FLASH_EXPERT_CACHE"
-# Attention projection weights: bfp4 (default) or bfp8.
+# Attention projection weights: bfp8 (default) or bfp4.
 ATTENTION_DTYPE_ENV = "DEEPSEEK_V4_FLASH_ATTENTION_DTYPE"
 # Log expert-pool hit rate after every prefill and every N decode steps; unset or 0 means off.
 POOL_STATS_ENV = "DEEPSEEK_V4_FLASH_POOL_STATS"
 # Streaming prefill block in tokens: 128 (fork default) up to 512, a multiple of 128.
 PREFILL_BLOCK_ENV = "DEEPSEEK_V4_FLASH_PREFILL_BLOCK"
 # Session continuation: 1 = when a new prompt shares the previous prompt's tokens up to that prompt's last
-# 128-token block start, restore the ring snapshot taken there and prefill only from it. Unset or 0 means off.
+# 128-token block start, restore the ring snapshot taken there and prefill only from it. Default 1; 0 turns it off.
 SESSION_REUSE_ENV = "DEEPSEEK_V4_FLASH_SESSION_REUSE"
 # 1 = keep the decode (and verify) traces across requests instead of recapturing them per request.
 # Long-lived buffers (token buffer, ring snapshot) are allocated before any capture; a request continues the
-# captured decode by rewriting its token / position inputs. Unset or 0 means off.
+# captured decode by rewriting its token / position inputs. Default 1 (always on with the DSpark drafter); 0 turns it off.
 PERSISTENT_TRACES_ENV = "DEEPSEEK_V4_FLASH_PERSISTENT_TRACES"
 _ATTENTION_DTYPES = {"bfp4": ttnn.bfloat4_b, "bfp8": ttnn.bfloat8_b}
 SUPPORTED_OPTIMIZATIONS = (None, "performance", "accuracy")
@@ -67,12 +67,12 @@ SPEC_ENV = "DEEPSEEK_V4_FLASH_SPEC"
 # Routed-expert pool per DSpark draft layer (default 32).
 DSPARK_POOL_ENV = "DEEPSEEK_V4_FLASH_DSPARK_POOL"
 # mHC A2: 1 = decode / verify run the fused mHC input-map epilogue with the official 20 Sinkhorn iterations
-# (MultichipDecoder.hc_pre_fused_epilogue). Unset or 0 means off.
+# (MultichipDecoder.hc_pre_fused_epilogue). Default 1; 0 turns it off.
 MHC_A2_ENV = "DEEPSEEK_V4_FLASH_MHC_A2"
 # 1 = the DSpark draft layers run A2 too (default 0: only the main model, see initialize_vllm_model).
 MHC_A2_DRAFTER_ENV = "DEEPSEEK_V4_FLASH_MHC_A2_DRAFTER"
 # comma-separated MultichipDecoder fusion switches turned on for the main model only (the DSpark draft layers
-# keep them off), e.g. "hc_pre_map_fused,compressor_pool_fused,moe_route_fused". Unset or empty: none.
+# keep them off). Default DEFAULT_FUSIONS; "none" turns them all off.
 FUSIONS_ENV = "DEEPSEEK_V4_FLASH_FUSIONS"
 # indexer plan B (MultichipDecoder.indexer_topk_dynamic): "1" / "0" overrides the class default, unset keeps it.
 INDEXER_DYNAMIC_ENV = "DEEPSEEK_V4_FLASH_INDEXER_DYNAMIC"
@@ -80,11 +80,11 @@ INDEXER_DYNAMIC_ENV = "DEEPSEEK_V4_FLASH_INDEXER_DYNAMIC"
 VERIFY_LOCAL_PAD_ENV = "DEEPSEEK_V4_FLASH_VERIFY_LOCAL_PAD"
 # (MultichipDecoder.prefill_moe_merge): "1" / "0" overrides the class default, unset keeps it.
 PREFILL_MOE_MERGE_ENV = "DEEPSEEK_V4_FLASH_PREFILL_MOE_MERGE"
-# DeepSeekV4FlashModel.prefill_pad_short: "1" / "0" overrides the class default, unset keeps it. On, a prompt of at
+# DeepSeekV4FlashModel.prefill_pad_short: default 1, "0" turns it off. On, a prompt of at
 # most 128 tokens runs as one padded 128-token streaming block, so new short prompt lengths never compile prefill
 # programs (which released every trace and, past PROGRAM_CACHE_PROMPT_SHAPES, cleared the program cache).
 PREFILL_PAD_SHORT_ENV = "DEEPSEEK_V4_FLASH_PREFILL_PAD_SHORT"
-# (experimental, default off): 1 = after a prefill that added program cache entries, release every trace before
+# Trace guard (default 1; "0" turns it off): after a prefill that added program cache entries, release every trace before
 # any replay (programs compiled behind live traces may have device buffers on a trace's freed intermediates).
 TRACE_GUARD_ENV = "DEEPSEEK_V4_FLASH_TRACE_GUARD"
 # with PREFILL_PAD_SHORT, "1" (default) compiles the padded prefill for every short length (1..128) at
@@ -104,6 +104,10 @@ SPEC_ADAPT_MIN_ENV = "DEEPSEEK_V4_FLASH_SPEC_ADAPT_MIN"
 SPEC_ADAPT_PROBE_ENV = "DEEPSEEK_V4_FLASH_SPEC_ADAPT_PROBE"
 SPEC_ADAPT_SMOOTHING = 0.3  # weight of the newest round in the average
 _FUSION_SWITCHES = ("hc_pre_map_fused", "compressor_pool_fused", "moe_route_fused", "hc_post_fused")
+# Tuned defaults for 4x Blackhole p150b (README); every one can be overridden by its environment variable.
+DEFAULT_EXPERT_POOL = 176
+DEFAULT_EXPERT_CACHE = "~/.cache/deepseek_v4_flash/experts_bfp4"
+DEFAULT_FUSIONS = "hc_pre_map_fused,compressor_pool_fused,hc_post_fused"
 
 
 def _single_value(value: Any, *, name: str) -> int:
@@ -122,18 +126,18 @@ def _prefill_start_position(value: Any) -> int:
 
 
 def _deployment() -> tuple[str, dict[str, Any]]:
-    attention = os.environ.get(ATTENTION_DTYPE_ENV, "bfp4").strip().lower() or "bfp4"
+    attention = os.environ.get(ATTENTION_DTYPE_ENV, "bfp8").strip().lower() or "bfp8"
     if attention not in _ATTENTION_DTYPES:
         raise ValueError(f"{ATTENTION_DTYPE_ENV} must be one of {sorted(_ATTENTION_DTYPES)}, got {attention!r}")
     extra: dict[str, Any] = {"attention_dtype": _ATTENTION_DTYPES[attention]}
     block = os.environ.get(PREFILL_BLOCK_ENV, "").strip()
     if block:
         extra["prefill_block_size"] = int(block)
-    value = os.environ.get(EXPERT_POOL_ENV, "off").strip().lower()
+    value = os.environ.get(EXPERT_POOL_ENV, str(DEFAULT_EXPERT_POOL)).strip().lower()
     if value in ("", "off", "0"):
         return QUIETBOX2_SELECTIVE_BFP4_POLICY, extra
     paging: dict[str, Any] = {"expert_pool_size": int(value), **extra}
-    cache = os.environ.get(EXPERT_CACHE_ENV, "").strip()
+    cache = os.environ.get(EXPERT_CACHE_ENV, DEFAULT_EXPERT_CACHE).strip()  # set but empty: no cache
     if cache:
         paging["expert_cache_dir"] = Path(cache).expanduser()
     return QUIETBOX2_PAGED_BFP4_POLICY, paging
@@ -261,7 +265,7 @@ class DeepseekV4ForCausalLM:
         self._pool_stats_last: dict[str, int] = {}
         self._decode_steps_since_stats = 0
         # DEEPSEEK_V4_FLASH_SESSION_REUSE=1: previous prompt, to find the shared prefix of the next one.
-        self._session_reuse = os.environ.get(SESSION_REUSE_ENV, "0").strip() == "1"
+        self._session_reuse = os.environ.get(SESSION_REUSE_ENV, "1").strip() == "1"
         self._previous_prompt: torch.Tensor | None = None
         # one captured verify trace per block width, and the last verify block (start, width) while the
         # committed position after it is still unknown (the next call's start_pos says how much was accepted).
@@ -270,14 +274,14 @@ class DeepseekV4ForCausalLM:
         # persistent traces. The token buffer and the ring snapshot are allocated here, before any
         # trace; _resync_pending marks a decode state that must be pointed at the new request's first token.
         # The drafter keeps a block trace for the server's lifetime, so with it every trace input is persistent.
-        self._persistent = os.environ.get(PERSISTENT_TRACES_ENV, "0").strip() == "1" or drafter is not None
+        self._persistent = os.environ.get(PERSISTENT_TRACES_ENV, "1").strip() == "1" or drafter is not None
         self._persistent_token_buffer: ttnn.Tensor | None = None
         self._decode_key: tuple | None = None
         self._resync_pending = False
         self._persistent_position_buffer: ttnn.Tensor | None = None
         self._spec = _spec_setting()
         self._adapt = os.environ.get(SPEC_ADAPT_ENV, "0").strip() == "1"
-        self._trace_guard = os.environ.get(TRACE_GUARD_ENV, "0").strip() == "1"
+        self._trace_guard = os.environ.get(TRACE_GUARD_ENV, "1").strip() == "1"
         self._adapt_min = float(os.environ.get(SPEC_ADAPT_MIN_ENV, "3.0") or 3.0)
         self._adapt_probe = int(os.environ.get(SPEC_ADAPT_PROBE_ENV, "32") or 32)
         self._adapt_reset()
@@ -410,8 +414,9 @@ class DeepseekV4ForCausalLM:
         if optimizations not in SUPPORTED_OPTIMIZATIONS:
             raise ValueError(f"unsupported optimizations={optimizations!r}; expected one of {SUPPORTED_OPTIMIZATIONS}")
         deployment_mode, paging = _deployment()
-        MultichipDecoder.hc_pre_fused_epilogue = os.environ.get(MHC_A2_ENV, "0").strip() == "1"
-        fusions = {name.strip() for name in os.environ.get(FUSIONS_ENV, "").split(",") if name.strip()}
+        MultichipDecoder.hc_pre_fused_epilogue = os.environ.get(MHC_A2_ENV, "1").strip() == "1"
+        fusions_setting = os.environ.get(FUSIONS_ENV, DEFAULT_FUSIONS).strip()
+        fusions = set() if fusions_setting == "none" else {name.strip() for name in fusions_setting.split(",") if name.strip()}
         if fusions - set(_FUSION_SWITCHES):
             raise ValueError(f"{FUSIONS_ENV}: unknown switches {sorted(fusions - set(_FUSION_SWITCHES))}")
         for name in _FUSION_SWITCHES:
@@ -425,7 +430,7 @@ class DeepseekV4ForCausalLM:
         moe_merge = os.environ.get(PREFILL_MOE_MERGE_ENV, "").strip()
         if moe_merge:
             MultichipDecoder.prefill_moe_merge = moe_merge == "1"
-        pad_short = os.environ.get(PREFILL_PAD_SHORT_ENV, "").strip()
+        pad_short = os.environ.get(PREFILL_PAD_SHORT_ENV, "1").strip()
         if pad_short:
             DeepSeekV4FlashModel.prefill_pad_short = pad_short == "1"
         prefill_hc = os.environ.get(PREFILL_HC_ENV, "").strip()
