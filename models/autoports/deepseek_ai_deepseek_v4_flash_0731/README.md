@@ -22,7 +22,7 @@ the p150b box needed and what made it fast:
 | Item | Version used |
 | --- | --- |
 | Cards | 4x Blackhole p150b, QSFP-DD ring 1-2-3-4-1 with two cables per hop (`p150_x4` mesh, `MeshShape(4, 1)`) |
-| Firmware | fw bundle 19.17.1 (Ethernet FW 1.13.1), flashed with tt-flash 4.2.0; 19.13.1 also works |
+| Firmware | fw bundle 19.17.1 (Ethernet FW 1.13.1), flashed with tt-flash 4.2.0 |
 | KMD | tt-kmd 2.11.0 |
 | Host | Ubuntu 22.04, kernel 6.8, 249 GB RAM (the expert pool pages from host memory) |
 | Python | 3.12 |
@@ -55,26 +55,57 @@ huggingface-cli download deepseek-ai/DeepSeek-V4-Flash-0731 --revision 7872f01b1
 
 ```bash
 export DEEPSEEK_MODEL=/path/to/DeepSeek-V4-Flash-0731
-timeout 180 tt-smi -r && models/autoports/deepseek_ai_deepseek_v4_flash_0731/vllm_models/run_server_p150b_x4.sh
+models/autoports/deepseek_ai_deepseek_v4_flash_0731/vllm_models/run_server_p150b_x4.sh
 ```
 
-- Reset the cards right before every multi-card open (the server, or any test that opens the 4-card mesh). After a
-  reset only the first multi-card open succeeds; a second one fails in Ethernet training.
+- The fabric runs with the upstream defaults (two-ERISC routers, strict link initialization). With firmware 19.17.1
+  the 4-card mesh opens repeatedly without a reset; after a hang or a crashed process, `timeout 180 tt-smi -r` first.
 - The first start builds the packed expert cache (`DEEPSEEK_V4_FLASH_EXPERT_CACHE`, default
   `~/.cache/deepseek_v4_flash/experts_bfp4`, about 156 GB) and takes much longer; later starts take a few minutes
   (about 3 of them compiling the short-prompt prefill programs).
 - The server listens on `127.0.0.1:8010` and serves `deepseek-ai/DeepSeek-V4-Flash-0731`. Thinking is controlled by
   `chat_template_kwargs: {"thinking": true}`.
-- Only device sampling is supported: do not send requests with `logprobs`, `min_tokens`, structured outputs or
-  logits processors (the engine core exits).
+- Only device sampling is supported: requests with `logprobs`, `min_tokens`, structured outputs (including a forced
+  `tool_choice`), `min_p`, `logit_bias` or logits processors are rejected with an error.
 
 Tools: `tools/chat_client.py` (interactive streaming chat with speed readout), `tools/realtext_speed.py` (fixed
 request set, ms/token per group), `tools/stress_requests.py` (N random requests with a hang deadline; `long` for
 150..900-token prompts).
 
+## Coding agents
+
+The server parses tool calls (`--enable-auto-tool-choice --tool-call-parser deepseek_v4`), so OpenAI-compatible
+agents work against it. Example [opencode](https://github.com/anomalyco/opencode) configuration
+(`opencode.json`):
+
+```json
+{
+  "provider": {
+    "dsv4": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek-V4-Flash (local)",
+      "options": { "baseURL": "http://127.0.0.1:8010/v1", "apiKey": "local" },
+      "models": {
+        "deepseek-ai/DeepSeek-V4-Flash-0731": {
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 131072, "output": 16384 }
+        }
+      }
+    }
+  },
+  "model": "dsv4/deepseek-ai/DeepSeek-V4-Flash-0731"
+}
+```
+
+The first request of a session prefills the agent's system prompt and tool definitions (often 10-20k tokens, tens of
+seconds); later turns only prefill what was added (session continuation).
+
 ## Switches
 
-All are environment variables read by the adapter; `run_server_p150b_x4.sh` sets the defaults below.
+All are environment variables read by the adapter. The defaults below are the adapter's own (tuned for this box), so
+nothing needs to be set; `run_server_p150b_x4.sh` only sets `DEEPSEEK_V4_FLASH_SPEC` (it must match vLLM's
+`--speculative-config`).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
