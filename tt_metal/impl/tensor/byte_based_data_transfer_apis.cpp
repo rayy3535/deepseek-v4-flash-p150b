@@ -5,6 +5,7 @@
 #include <tt-metalium/experimental/byte_based_tensor_transfers.hpp>
 
 #include "mesh_tensor_impl.hpp"
+#include "impl/context/metal_context.hpp"
 
 namespace tt::tt_metal {
 
@@ -33,6 +34,31 @@ void enqueue_write_tensor(
             .host_data(const_cast<std::byte*>(src))
             .region(region)};
     queue.enqueue_write_shards(device_tensor.impl().raw_mesh_buffer(), shard_data_transfers, false);
+}
+
+void enqueue_write_tensor_region(
+    distributed::MeshCommandQueue& queue,
+    const HostTensor& host_tensor,
+    const MeshTensor& device_tensor,
+    std::size_t offset,
+    bool blocking) {
+    // Fast dispatch takes the region's own bytes as the source; slow dispatch would index src by the offset.
+    TT_FATAL(
+        MetalContext::instance().rtoptions().get_fast_dispatch(), "enqueue_write_tensor_region requires fast dispatch");
+    const auto& host_buffer = host_tensor.buffer();
+    std::vector<distributed::ShardDataTransfer> shard_data_transfers;
+    shard_data_transfers.reserve(host_buffer.shard_coords().size());
+    for (const auto& coord : host_buffer.shard_coords()) {
+        auto shard = host_buffer.get_shard(coord);
+        if (!shard.has_value()) {
+            continue;  // shard owned by another host
+        }
+        auto bytes = shard->view_bytes();
+        shard_data_transfers.push_back(distributed::ShardDataTransfer{distributed::MeshCoordinate(coord)}
+                                           .host_data(bytes.data())
+                                           .region(BufferRegion(offset, bytes.size())));
+    }
+    queue.enqueue_write_shards(device_tensor.impl().raw_mesh_buffer(), shard_data_transfers, blocking);
 }
 
 }  // namespace tt::tt_metal

@@ -18,6 +18,7 @@
 #include "ttnn/common/queue_id.hpp"
 #include "ttnn/tensor/tensor_ops.hpp"
 #include "ttnn/operations/experimental/core_subset_write/copy_to_device_filtered.hpp"
+#include <tt-metalium/experimental/byte_based_tensor_transfers.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/base_types.hpp>
 #include <tt-metalium/core_coord.hpp>
@@ -361,6 +362,36 @@ void py_module(nb::module_& mod) {
 
             Limitations:
                 -  Host and Device tensors must be the same shape, have the same datatype, and have the same data layout (ROW_MAJOR or TILE).
+        )doc");
+
+    mod.def(
+        "copy_host_to_device_tensor_region",
+        [](const ttnn::Tensor& host_tensor,
+           ttnn::Tensor& device_tensor,
+           std::size_t offset_bytes,
+           const std::optional<QueueId>& cq_id) {
+            TT_FATAL(
+                host_tensor.storage_type() == StorageType::HOST && device_tensor.storage_type() == StorageType::DEVICE,
+                "copy_host_to_device_tensor_region copies a host tensor into a device tensor");
+            TT_FATAL(
+                host_tensor.dtype() == device_tensor.dtype() && host_tensor.layout() == device_tensor.layout(),
+                "host and device tensors must have the same dtype and layout");
+            auto& cq = device_tensor.device()->mesh_command_queue(raw_optional(cq_id));
+            tt::tt_metal::enqueue_write_tensor_region(
+                cq, host_tensor.host_tensor(), device_tensor.device_storage().get_mesh_tensor(), offset_bytes);
+        },
+        nb::arg("host_tensor"),
+        nb::arg("device_tensor"),
+        nb::arg("offset_bytes"),
+        nb::arg("cq_id") = nb::none(),
+        R"doc(
+        Writes each shard of a host tensor into the byte range [offset_bytes, offset_bytes + shard size) of the
+        matching shard of a pre-allocated device tensor, leaving the rest of the device tensor unchanged.
+
+        The host tensor must already be in the device tensor's dtype and layout (for TILE layouts that means
+        packed tiles), and ``offset_bytes`` must be a multiple of the device buffer's page size. Typical use:
+        fill one slot ``[0, s]`` of a ``[1, S, K, N]`` interleaved TILE tensor from a ``[1, 1, K, N]`` host
+        tensor at ``offset_bytes = s * (K // 32) * (N // 32) * tile_bytes``. Fast dispatch only.
         )doc");
 
     mod.def(

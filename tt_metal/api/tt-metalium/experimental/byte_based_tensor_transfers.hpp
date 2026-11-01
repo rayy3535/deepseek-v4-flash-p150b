@@ -8,6 +8,7 @@
 #include <optional>
 
 #include <tt-metalium/buffer.hpp>
+#include <tt-metalium/tensor/host_tensor.hpp>
 #include <tt-metalium/tensor/mesh_tensor.hpp>
 #include <tt-metalium/mesh_command_queue.hpp>
 
@@ -34,5 +35,16 @@ void enqueue_write_tensor(
     const std::byte* src,
     MeshTensor& device_tensor,
     const std::optional<BufferRegion>& region = std::nullopt);
+
+// Writes every shard of a (possibly multi-device) host tensor into the same byte range of the matching
+// device shard: [offset, offset + host shard size). The offset must be page aligned and the range must lie
+// inside the device buffer. Fast dispatch only. Lets a host-paged weight pool fill one slot of a larger
+// device tensor without rewriting the rest of it.
+void enqueue_write_tensor_region(
+    distributed::MeshCommandQueue& queue,
+    const HostTensor& host_tensor,
+    const MeshTensor& device_tensor,
+    std::size_t offset,
+    bool blocking = false);
 
 }  // namespace tt::tt_metal

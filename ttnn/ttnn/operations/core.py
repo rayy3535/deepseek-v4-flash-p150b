@@ -583,6 +583,10 @@ ttnn.register_python_operation(
 )(ttnn._ttnn.operations.core.copy_host_to_device_tensor_partial)
 # Per-core partial writes have no safe dense-tensor golden without the device shard mapping.
 ttnn.register_python_operation(
+    name="ttnn.copy_host_to_device_tensor_region",
+    doc=ttnn._ttnn.operations.core.copy_host_to_device_tensor_region.__doc__,
+)(ttnn._ttnn.operations.core.copy_host_to_device_tensor_region)
+ttnn.register_python_operation(
     name="ttnn.copy_device_to_host_tensor",
 )(ttnn._ttnn.operations.core.copy_device_to_host_tensor)
 ttnn.attach_golden_function(
