@@ -1344,6 +1344,9 @@ class MultichipDecoder(OptimizedDecoder):
     # the merged prefill MoE cuts its grouped calls only at 32-token boundaries (fixed call lengths; a
     # routing-dependent length compiled new programs behind live traces on most long prompts).
     prefill_moe_merge_aligned = True
+    # Streaming prefill page-table ranges come from the host copy of the table instead of a device slice (same values;
+    # a device slice compiled a program per new block position).
+    streaming_host_page_tables = True
     # a prefill block's router as one call over all its rows instead of one per 32-token chunk.
     prefill_route_merge = False
     # a verify block's M rows go into the local / compressor caches with one program per cache
@@ -3114,6 +3117,21 @@ class MultichipDecoder(OptimizedDecoder):
         self._capture_prefill_boundary("attention_heads_inverse_rope", attention)
         return self._grouped_output_projection(attention, plan.seq_len)
 
+    def _page_table_range(self, cache: PagedTensor, first_page: int, last_page: int) -> ttnn.Tensor:
+        """Logical pages [first_page, last_page) of ``cache``'s page table as a [1, n] int32 device tensor.
+
+        With streaming_host_page_tables the range is uploaded from the host copy of the table (same values): slicing
+        the device table compiles a slice program per distinct (start, length), so every new block position of a
+        long prompt compiled programs (and, in a server, released and recaptured the traces)."""
+
+        if self.streaming_host_page_tables:
+            return self._to_tt(
+                torch.tensor(cache.host_page_table[first_page:last_page], dtype=torch.int32).reshape(1, -1),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+        return ttnn.slice(cache.page_table, [0, first_page], [1, last_page])
+
     def _streaming_fill_page_aligned(
         self,
         cache: PagedTensor,
@@ -3134,11 +3152,7 @@ class MultichipDecoder(OptimizedDecoder):
         # each call monotonically contiguous while retaining page-sized bulk
         # fills and the exact logical page table.
         for run_start, run_end in _contiguous_page_runs(physical_pages):
-            page_table = ttnn.slice(
-                cache.page_table,
-                [0, first_page + run_start],
-                [1, first_page + run_end],
-            )
+            page_table = self._page_table_range(cache, first_page + run_start, first_page + run_end)
             run_value = (
                 value
                 if run_start == 0 and run_end == page_count
@@ -3182,15 +3196,9 @@ class MultichipDecoder(OptimizedDecoder):
             raise ValueError(f"raw compressor fill start {logical_start} is not page aligned")
         first_page = logical_start // page_size
         page_count = fill_length // page_size
-        compressor_page_table = ttnn.slice(
-            self.cache.compressor_kv.page_table,
-            [0, first_page],
-            [1, first_page + page_count],
-        )
-        local_page_table = ttnn.slice(
-            self.cache.local.page_table,
-            [0, block_start // page_size],
-            [1, (block_start + seq_len) // page_size],
+        compressor_page_table = self._page_table_range(self.cache.compressor_kv, first_page, first_page + page_count)
+        local_page_table = self._page_table_range(
+            self.cache.local, block_start // page_size, (block_start + seq_len) // page_size
         )
         return PrefillPlan(
             valid_seq_len,
