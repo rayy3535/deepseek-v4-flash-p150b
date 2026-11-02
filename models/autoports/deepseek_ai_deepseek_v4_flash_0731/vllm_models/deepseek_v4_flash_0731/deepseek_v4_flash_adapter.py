@@ -35,6 +35,7 @@ from models.autoports.deepseek_ai_deepseek_v4_flash_0731.tt.multichip_decoder im
     QUIETBOX2_SELECTIVE_BFP4_POLICY,
     TARGET_MESH_SHAPE,
     MultichipDecoder,
+    MultichipDeepSeekSparseMoE,
 )
 
 CHECKPOINT_ENV = "DEEPSEEK_V4_FLASH_HF_MODEL"
@@ -45,6 +46,8 @@ EXPERT_POOL_ENV = "DEEPSEEK_V4_FLASH_EXPERT_POOL"
 EXPERT_CACHE_ENV = "DEEPSEEK_V4_FLASH_EXPERT_CACHE"
 # Attention projection weights: bfp8 (default) or bfp4.
 ATTENTION_DTYPE_ENV = "DEEPSEEK_V4_FLASH_ATTENTION_DTYPE"
+# Shared-expert weights: bfp8 (default, the checkpoint's FP8 precision) or bfp4.
+SHARED_DTYPE_ENV = "DEEPSEEK_V4_FLASH_SHARED_DTYPE"
 # Log expert-pool hit rate after every prefill and every N decode steps; unset or 0 means off.
 POOL_STATS_ENV = "DEEPSEEK_V4_FLASH_POOL_STATS"
 # Streaming prefill block in tokens: 128 (fork default) up to 512, a multiple of 128.
@@ -130,6 +133,10 @@ def _deployment() -> tuple[str, dict[str, Any]]:
     if attention not in _ATTENTION_DTYPES:
         raise ValueError(f"{ATTENTION_DTYPE_ENV} must be one of {sorted(_ATTENTION_DTYPES)}, got {attention!r}")
     extra: dict[str, Any] = {"attention_dtype": _ATTENTION_DTYPES[attention]}
+    shared = os.environ.get(SHARED_DTYPE_ENV, "bfp8").strip().lower() or "bfp8"
+    if shared not in _ATTENTION_DTYPES:
+        raise ValueError(f"{SHARED_DTYPE_ENV} must be one of {sorted(_ATTENTION_DTYPES)}, got {shared!r}")
+    MultichipDeepSeekSparseMoE.shared_dtype = _ATTENTION_DTYPES[shared]
     block = os.environ.get(PREFILL_BLOCK_ENV, "").strip()
     if block:
         extra["prefill_block_size"] = int(block)
@@ -416,7 +423,11 @@ class DeepseekV4ForCausalLM:
         deployment_mode, paging = _deployment()
         MultichipDecoder.hc_pre_fused_epilogue = os.environ.get(MHC_A2_ENV, "1").strip() == "1"
         fusions_setting = os.environ.get(FUSIONS_ENV, DEFAULT_FUSIONS).strip()
-        fusions = set() if fusions_setting == "none" else {name.strip() for name in fusions_setting.split(",") if name.strip()}
+        fusions = (
+            set()
+            if fusions_setting == "none"
+            else {name.strip() for name in fusions_setting.split(",") if name.strip()}
+        )
         if fusions - set(_FUSION_SWITCHES):
             raise ValueError(f"{FUSIONS_ENV}: unknown switches {sorted(fusions - set(_FUSION_SWITCHES))}")
         for name in _FUSION_SWITCHES:

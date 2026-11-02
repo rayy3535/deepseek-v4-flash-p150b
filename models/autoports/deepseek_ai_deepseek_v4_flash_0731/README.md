@@ -113,6 +113,7 @@ nothing needs to be set; `run_server_p150b_x4.sh` only sets `DEEPSEEK_V4_FLASH_S
 | `DEEPSEEK_V4_FLASH_EXPERT_POOL` | `176` | routed experts resident per layer (all BFP4, host-paged); `off` = all-resident selective BFP2/BFP4 (needs a build with BFP2) |
 | `DEEPSEEK_V4_FLASH_EXPERT_CACHE` | `~/.cache/deepseek_v4_flash/experts_bfp4` | packed expert cache directory; empty disables it |
 | `DEEPSEEK_V4_FLASH_ATTENTION_DTYPE` | `bfp8` | attention projection weights (`bfp4` saves 1.36 GiB per device) |
+| `DEEPSEEK_V4_FLASH_SHARED_DTYPE` | `bfp8` | shared-expert weights (`bfp4` saves 0.13 GiB per device) |
 | `DEEPSEEK_V4_FLASH_SESSION_REUSE` | `1` | resume a prompt that extends the previous one from a ring snapshot (bitwise) |
 | `DEEPSEEK_V4_FLASH_PERSISTENT_TRACES` | `1` | keep decode / verify traces across requests (bitwise) |
 | `DEEPSEEK_V4_FLASH_MHC_A2` | `1` | fused mHC input-map epilogue with 20 Sinkhorn iterations |

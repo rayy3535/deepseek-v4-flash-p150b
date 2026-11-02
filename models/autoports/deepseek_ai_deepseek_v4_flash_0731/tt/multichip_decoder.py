@@ -531,6 +531,13 @@ class MultichipDeepSeekSparseMoE:
     routed_down_subblock = 2
     routed_gate_block = 0  # in0_block_w (K tiles per block)
     routed_down_block = 0
+    # shared-expert weight dtype: None keeps weights_dtype (BFLOAT4_B); BFLOAT8_B matches the checkpoint's FP8
+    # precision at about +0.13 GiB per device per weight copy.
+    shared_dtype = None
+    # keep a resident interleaved copy of each DRAM-sharded shared weight for multi-row (prefill / verify) matmuls;
+    # False (default) makes a one-layer transient copy per call instead: bit-identical logits, ~0.14 GiB per
+    # device more free DRAM at BFP4
+    keep_interleaved_shared = False
 
     def __init__(
         self,
@@ -579,7 +586,7 @@ class MultichipDeepSeekSparseMoE:
             raise ValueError(f"unknown multichip MoE compute profile {compute_profile!r}")
         self.compute_profile = compute_profile
         if self.weights_dtype != ttnn.bfloat4_b:
-            raise ValueError(f"routed down and shared experts require BFLOAT4_B, got {self.weights_dtype}")
+            raise ValueError(f"routed down experts require BFLOAT4_B, got {self.weights_dtype}")
         if self.routed_gate_up_dtype not in {getattr(ttnn, "bfloat2_b", None), ttnn.bfloat4_b} - {None}:
             raise ValueError(
                 "routed gate/up experts require BFLOAT2_B or BFLOAT4_B, " f"got {self.routed_gate_up_dtype}"
@@ -669,6 +676,9 @@ class MultichipDeepSeekSparseMoE:
             self.routed_up = upload(routed_up.unsqueeze(0), -1, self.routed_gate_up_dtype)
         if self.pool is None:
             self.routed_down = upload(expert_w2.transpose(-2, -1).unsqueeze(0), -2, self.weights_dtype)
+        shared_dtype = self.shared_dtype or self.weights_dtype
+        if shared_dtype not in {ttnn.bfloat4_b, ttnn.bfloat8_b}:
+            raise ValueError(f"shared experts require BFLOAT4_B or BFLOAT8_B, got {shared_dtype}")
         shared_gate = shared_w1.transpose(-2, -1)
         shared_up = shared_w3.transpose(-2, -1)
         shared_gate_chunks = shared_gate.chunk(TP_DEGREE, dim=-1)
@@ -681,14 +691,14 @@ class MultichipDeepSeekSparseMoE:
                 ],
                 dim=-1,
             )
-            self.shared_gate_up = upload(shared_gate_up, -1, self.weights_dtype)
+            self.shared_gate_up = upload(shared_gate_up, -1, shared_dtype)
             self.shared_gate = None
             self.shared_up = None
         else:
             self.shared_gate_up = None
-            self.shared_gate = upload(shared_gate, -1, self.weights_dtype)
-            self.shared_up = upload(shared_up, -1, self.weights_dtype)
-        self.shared_down = upload(shared_w2.transpose(-2, -1), -2, self.weights_dtype)
+            self.shared_gate = upload(shared_gate, -1, shared_dtype)
+            self.shared_up = upload(shared_up, -1, shared_dtype)
+        self.shared_down = upload(shared_w2.transpose(-2, -1), -2, shared_dtype)
 
         # routed sparse-matmul core grids: the class attributes (geometry sweep) win over the DSV4_ experiment
         # variables, which the qualified full-model build rejects
@@ -786,8 +796,12 @@ class MultichipDeepSeekSparseMoE:
                     ttnn.ShardOrientation.ROW_MAJOR,
                 ),
             )
-            self._shared_interleaved_weights[attribute] = weight
-            setattr(self, attribute, ttnn.to_memory_config(weight, weight_memory))
+            sharded = ttnn.to_memory_config(weight, weight_memory)
+            if self.keep_interleaved_shared:
+                self._shared_interleaved_weights[attribute] = weight
+            else:
+                ttnn.deallocate(weight)
+            setattr(self, attribute, sharded)
             self._shared_dram_programs[attribute] = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
                 in0_block_w=in0_block_w,
                 per_core_M=1,
@@ -809,13 +823,22 @@ class MultichipDeepSeekSparseMoE:
 
     def _shared_linear(self, value: ttnn.Tensor, attribute: str) -> ttnn.Tensor:
         if not self.use_shared_dram_sharding or attribute not in self._shared_dram_programs:
-            return ttnn.linear(
+            weight = self._shared_interleaved_weights.get(attribute)
+            transient = weight is None and attribute in self._shared_dram_programs
+            if transient:  # one-layer interleaved copy of the sharded weight (same values) instead of a resident one
+                weight = ttnn.to_memory_config(getattr(self, attribute), ttnn.DRAM_MEMORY_CONFIG)
+            elif weight is None:
+                weight = getattr(self, attribute)
+            output = ttnn.linear(
                 value,
-                self._shared_interleaved_weights.get(attribute, getattr(self, attribute)),
+                weight,
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 compute_kernel_config=self.compute_kernel_config,
             )
+            if transient:
+                ttnn.deallocate(weight)
+            return output
         shape = tuple(value.shape)
         rows = math.prod(shape[:-1])
         k, n = tuple(getattr(self, attribute).shape)[-2:]
