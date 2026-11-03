@@ -94,7 +94,11 @@ void kernel_main() {
     noc.async_read_barrier();
     partial_cb.push_back(split);
     volatile tt_l1_ptr uint32_t* bias = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base_cb.get_write_ptr());
-    for (uint32_t m = 1; m < end_row; ++m) {
+    // Broadcast the bias to the tile rows the compute kernel reads: row 0 only for map partials (raw holds this
+    // core's row in row 0), block rows 0 .. end_row - 1 (<= 32) otherwise. end_row is an absolute block row, so
+    // looping to it for a prefill block wrote past this 32-row tile into the next circular buffers.
+    const uint32_t bias_rows = from_map ? 1 : end_row;
+    for (uint32_t m = 1; m < bias_rows; ++m) {
         for (uint32_t c = 0; c < width; ++c) {
             bias[at(m, c)] = bias[at(0, c)];
         }
