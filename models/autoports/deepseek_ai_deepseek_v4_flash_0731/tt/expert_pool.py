@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
@@ -144,6 +145,19 @@ def _host_tensor(weight: torch.Tensor, mapper, dtype: ttnn.DataType) -> ttnn.Ten
 class ExpertPool:
     """Device pool, slot table and host LRU for one layer."""
 
+    # eviction: "lru" (least recently used) or "lfu" (fewest requests so far, ties by recency). On the recorded
+    # routing at batch 8 / pool 176, LFU loads ~15% fewer experts per decode step.
+    eviction = "lru"
+    # load experts as large pages: each expert's packed tiles (the host store bytes, pinned once) are DMA'd into a
+    # staging buffer with 9216 B pages and moved into their pool slots on the device (kernels/expert_repack/);
+    # ~1.8x the host -> device rate of the per-tile (576 B page) writes. Needs the IOMMU in DMA mode for pinning.
+    large_page_loads = False
+    # per-tile loads: all of a call's experts in one batched region write per pool (same bytes, same order). Off:
+    # no measurable gain over one write per expert (batch-8 steps within the run-to-run spread).
+    batched_tile_writes = False
+    # per-tile loads read straight from pinned host memory (needs the IOMMU in DMA mode; falls back to a copy)
+    tile_writes_pin = False
+
     def __init__(
         self,
         mesh_device: ttnn.MeshDevice,
@@ -194,6 +208,13 @@ class ExpertPool:
         )
         self.loads = 0
         self.table_writes = 0
+        # the device slot table lags the host one: set by ensure(write_table=False) (the static verify / batch MoE
+        # takes its slot ids from the host, not the table), written by the next ensure() that writes the table
+        self._table_dirty = False
+        # large-page loads: the last chunk of the latest ensure(defer_last_repack=True), left in staging for the
+        # caller's repack (_LargePageLoader.repack_from, before any of those slots is read)
+        self.deferred_slots: list[int] = []
+        self.pending_slots: list[int] = []  # assigned by ensure(load=False), written by load_pending()
         # Hit-rate counters: ensure() calls and distinct experts asked for; hits = requested - loads.
         self.ensure_calls = 0
         self.requested = 0
@@ -201,6 +222,22 @@ class ExpertPool:
         if len(first) > pool_size or len(set(first)) != len(first):
             raise ValueError("initial experts must be unique and fit in the pool")
         self._place(first)
+        self._zero_null_slot()
+
+    def _zero_null_slot(self) -> None:
+        """Zero weights in the null slot: the static MoE computes its unused groups on it, and their rows enter the
+        one-hot combine multiplied by 0, which is exact only for finite values (an allocation holds stale bytes)."""
+        writer = getattr(ttnn, "copy_host_to_device_tensor_region", None)
+        if writer is None:
+            return
+        for pool, shape in ((self.gate_up, self._gate_up_shape), (self.down, self._down_shape)):
+            zeros = ttnn.from_torch(
+                torch.zeros(1, 1, *shape),
+                dtype=self.store.dtype,
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            writer(zeros, pool, slot_offset_bytes(pool, self.null_slot))
 
     def _table_torch(self) -> torch.Tensor:
         return torch.tensor(self.slot_of, dtype=torch.bfloat16).reshape(-1, 1)
@@ -232,8 +269,14 @@ class ExpertPool:
         self.expert_in[slot] = expert
         self.slot_of[expert] = slot
 
-    def ensure(self, experts: Iterable[int]) -> int:
-        """Make every listed expert resident; never evicts a listed expert. Returns the number loaded."""
+    def ensure(
+        self, experts: Iterable[int], *, write_table: bool = True, defer_last_repack: bool = False, load: bool = True
+    ) -> int:
+        """Make every listed expert resident; never evicts a listed expert. Returns the number loaded.
+
+        ``write_table=False`` leaves the device slot table stale (written by the next ensure() that writes it);
+        ``defer_last_repack`` (large-page loads) leaves the last chunk in staging, its slots in ``deferred_slots``.
+        ``load=False`` only assigns the slots (``pending_slots``); load_pending() writes them later."""
 
         wanted = list(dict.fromkeys(int(e) for e in experts))
         if len(wanted) > self.pool_size:
@@ -241,29 +284,75 @@ class ExpertPool:
         pinned = set(wanted)
         self.ensure_calls += 1
         self.requested += len(wanted)
+        lfu = self.eviction == "lfu"
+        if lfu:
+            counts = self.__dict__.setdefault("_request_counts", {})
+            for expert in wanted:
+                counts[expert] = counts.get(expert, 0) + 1
         written = []
         for expert in wanted:
             slot = self.slot_of[expert]
             if slot == self.null_slot:
-                slot = next(s for s in self._lru if self.expert_in[s] not in pinned)
+                if lfu:  # fewest requests; min() keeps the first (least recent) of equal counts
+                    slot = min(
+                        (s for s in self._lru if self.expert_in[s] not in pinned),
+                        key=lambda s: counts.get(self.expert_in[s], 0),
+                    )
+                else:
+                    slot = next(s for s in self._lru if self.expert_in[s] not in pinned)
                 self._assign(slot, expert)
                 written.append(slot)
             self._lru.move_to_end(slot)
+        self.deferred_slots = []
+        if self.pending_slots:
+            raise RuntimeError("ensure() with loads still pending (call load_pending first)")
         if written:
-            self._write_slots(written)
-            self._write_table()
+            if load:
+                self.deferred_slots = self._write_slots(written, defer_last_repack=defer_last_repack)
+            else:
+                self.pending_slots = list(written)
             self.loads += len(written)
+            self._table_dirty = True
+        if write_table and self._table_dirty:
+            self._write_table()
+            self._table_dirty = False
         return len(written)
 
-    def _write_slots(self, slots: Sequence[int]) -> None:
+    def load_pending(self, cq_id: int = 0) -> None:
+        """Write the slots ensure(load=False) assigned, on command queue ``cq_id``. Large-page loads only DMA to
+        staging (one chunk, <= MAX_BATCH); the caller repacks them (_LargePageLoader.repack_from)."""
+        slots, self.pending_slots = self.pending_slots, []
+        if slots:
+            self._write_slots(slots, defer_last_repack=True, cq_id=cq_id)
+
+    def _write_slots(self, slots: Sequence[int], *, defer_last_repack: bool = False, cq_id: int = 0) -> list[int]:
+        """Returns the slots whose repack was deferred (large-page loads, ``defer_last_repack``), else []."""
         writer = getattr(ttnn, "copy_host_to_device_tensor_region", None)
+        if writer is not None and self.large_page_loads:
+            return _LargePageLoader.get(self.mesh_device).load(
+                self, slots, defer_last_repack=defer_last_repack, cq_id=cq_id
+            )
+        batch_writer = _regions_writer()
+        if batch_writer is not None and self.batched_tile_writes:  # one queue submission per pool
+            for pool, store in ((self.gate_up, self.store.gate_up), (self.down, self.store.down)):
+                batch_writer(
+                    [store[self.expert_in[slot]] for slot in slots],
+                    pool,
+                    [slot_offset_bytes(pool, slot) for slot in slots],
+                    cq_id=ttnn.QueueId(cq_id),
+                    pin=self.tile_writes_pin,
+                )
+            return []
         if writer is not None:
+            if cq_id:
+                raise ValueError("loads on another command queue need the batched region writer")
             for slot in slots:
                 expert = self.expert_in[slot]
                 writer(self.store.gate_up[expert], self.gate_up, slot_offset_bytes(self.gate_up, slot))
                 writer(self.store.down[expert], self.down, slot_offset_bytes(self.down, slot))
-            return
+            return []
         self._rewrite_whole_pool()
+        return []
 
     def _rewrite_whole_pool(self) -> None:
         """Placeholder until a region write is bound: re-upload both pool tensors. Test-only."""
@@ -300,6 +389,14 @@ class ExpertPool:
         return ttnn.to_layout(ttnn.typecast(slots, ttnn.uint16), ttnn.ROW_MAJOR_LAYOUT)
 
 
+def _regions_writer():
+    """copy_host_to_device_tensor_regions (several host tensors into one device tensor, one queue submission): only
+    bound in the C++ module, not re-exported at the ttnn top level."""
+    return getattr(ttnn, "copy_host_to_device_tensor_regions", None) or getattr(
+        ttnn._ttnn.operations.core, "copy_host_to_device_tensor_regions", None
+    )
+
+
 def slot_offset_bytes(pool: ttnn.Tensor, slot: int) -> int:
     """Byte offset of a slot in an interleaved TILE pool [1, S, K, N]: slots are contiguous runs of tile pages."""
 
@@ -308,3 +405,186 @@ def slot_offset_bytes(pool: ttnn.Tensor, slot: int) -> int:
     if pool.buffer_num_pages() != shape[-3] * pages_per_slot:
         raise RuntimeError("pool buffer is not one page per tile")
     return slot * pages_per_slot * pool.buffer_page_size()
+
+
+class _LargePageLoader:
+    """Shared staging buffers (one per pool shape, all layers) and the device repack program."""
+
+    TILES_PER_PAGE = 16
+    MAX_BATCH = 16
+    CORES = int(os.environ.get("LP_REPACK_CORES", "16"))
+    DEPTH = int(os.environ.get("LP_REPACK_DEPTH", "16"))
+    _instances: dict = {}
+
+    @classmethod
+    def get(cls, mesh_device) -> "_LargePageLoader":
+        key = id(mesh_device)
+        if key not in cls._instances:
+            cls._instances[key] = cls(mesh_device)
+        return cls._instances[key]
+
+    def __init__(self, mesh_device) -> None:
+        self.mesh_device = mesh_device
+        self.staging: dict = {}
+
+    def _staging(self, pool: ttnn.Tensor) -> tuple[ttnn.Tensor, int, int]:
+        shape = tuple(pool.padded_shape)
+        if shape not in self.staging:
+            tiles = (shape[-2] // 32) * (shape[-1] // 32)  # per slot, per card
+            if tiles % self.TILES_PER_PAGE:
+                raise ValueError(f"expert of {tiles} tiles is not a whole number of {self.TILES_PER_PAGE}-tile pages")
+            pages = tiles // self.TILES_PER_PAGE
+            page_words = self.TILES_PER_PAGE * pool.buffer_page_size() // 4
+            devices = self.mesh_device.get_num_devices()
+            tensor = ttnn.from_torch(
+                torch.zeros(1, 1, self.MAX_BATCH * pages, devices * page_words, dtype=torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.mesh_device,
+                mesh_mapper=ttnn.create_mesh_mapper(
+                    self.mesh_device,
+                    ttnn.MeshMapperConfig(
+                        placements=[ttnn.PlacementShard(-1)], mesh_shape_override=ttnn.MeshShape([devices])
+                    ),
+                ),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            self.staging[shape] = (tensor, tiles, pages)
+        return self.staging[shape]
+
+    PARAMS_WORDS = 32  # [n, slot 0 .. slot MAX_BATCH - 1], padded to 128 B
+
+    def _params(self) -> ttnn.Tensor:
+        if getattr(self, "params", None) is None:
+            self.params = ttnn.from_torch(
+                torch.zeros(1, self.PARAMS_WORDS, dtype=torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.mesh_device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        return self.params
+
+    def _program(self, staging: ttnn.Tensor, pool: ttnn.Tensor, tiles: int, params: ttnn.Tensor | None = None):
+        """One static program per (staging, pool, params): every runtime argument is constant. ``params``: a uint32
+        row-major device tensor whose first PARAMS_WORDS words are [n, slot 0, ...] (default: the loader's own)."""
+
+        params = self._params() if params is None else params
+        key = (id(staging), id(pool), id(params))
+        programs = self.__dict__.setdefault("programs", {})
+        if key not in programs:
+            grid = self.mesh_device.compute_with_storage_grid_size()
+            cores_n = min(self.CORES, grid.x * grid.y)
+            coords = [(k % grid.x, k // grid.x) for k in range(cores_n)]
+            cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in coords])
+            tile_bytes = pool.buffer_page_size()
+            rt = ttnn.RuntimeArgs()
+            for k, (x, y) in enumerate(coords):
+                rt[x][y] = [staging.buffer_address(), pool.buffer_address(), params.buffer_address(), k, cores_n]
+            kernel = Path(__file__).resolve().parent / "kernels" / "expert_repack" / "repack_tiles.cpp"
+            program = ttnn.ProgramDescriptor(
+                kernels=[
+                    ttnn.KernelDescriptor(
+                        kernel_source=str(kernel),
+                        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                        core_ranges=cores,
+                        compile_time_args=[tile_bytes, tiles, self.TILES_PER_PAGE, self.DEPTH, self.PARAMS_WORDS * 4]
+                        + ttnn.TensorAccessorArgs(staging).get_compile_time_args()
+                        + ttnn.TensorAccessorArgs(pool).get_compile_time_args()
+                        + ttnn.TensorAccessorArgs(params).get_compile_time_args(),
+                        runtime_args=rt,
+                        config=ttnn.ReaderConfigDescriptor(),
+                    )
+                ],
+                semaphores=[],
+                cbs=[
+                    ttnn.CBDescriptor(
+                        total_size=self.DEPTH * tile_bytes,
+                        core_ranges=cores,
+                        format_descriptors=[
+                            ttnn.CBFormatDescriptor(buffer_index=0, data_format=pool.dtype, page_size=tile_bytes)
+                        ],
+                    ),
+                    ttnn.CBDescriptor(
+                        total_size=self.PARAMS_WORDS * 4,
+                        core_ranges=cores,
+                        format_descriptors=[
+                            ttnn.CBFormatDescriptor(
+                                buffer_index=1, data_format=ttnn.uint32, page_size=self.PARAMS_WORDS * 4
+                            )
+                        ],
+                    ),
+                ],
+            )
+            programs[key] = program
+        return programs[key]
+
+    def _write_params(self, slots: Sequence[int]) -> None:
+        values = torch.zeros(1, self.PARAMS_WORDS, dtype=torch.int32)
+        values[0, 0] = len(slots)
+        values[0, 1 : 1 + len(slots)] = torch.tensor(list(slots), dtype=torch.int32)
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(
+                values,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            ),
+            self._params(),
+        )
+
+    def _repack(self, staging: ttnn.Tensor, pool: ttnn.Tensor, tiles: int, params: ttnn.Tensor | None = None) -> None:
+        params = self._params() if params is None else params
+        ttnn.generic_op([staging, pool, params], self._program(staging, pool, tiles, params))
+
+    def repack_from(self, pool_owner: "ExpertPool", params: ttnn.Tensor) -> None:
+        """Device side of a deferred chunk (traceable): repack both pools, slots read from ``params`` on device."""
+        for pool in (pool_owner.gate_up, pool_owner.down):
+            staging, tiles, _ = self._staging(pool)
+            self._repack(staging, pool, tiles, params)
+
+    def prepin(self, pool_owner: "ExpertPool") -> None:
+        """Pin every expert of this pool's host store once (a pinned write into staging slot 0); later loads then
+        hit the pin cache (set TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES above the store size, default 4 GiB)."""
+
+        writer = ttnn.copy_host_to_device_tensor_region
+        for pool, store in ((pool_owner.gate_up, pool_owner.store.gate_up), (pool_owner.down, pool_owner.store.down)):
+            staging, _, _ = self._staging(pool)
+            for host in store:
+                writer(host, staging, 0, pin=True, raw_bytes=True)
+
+    def load(
+        self, pool_owner: "ExpertPool", slots: Sequence[int], *, defer_last_repack: bool = False, cq_id: int = 0
+    ) -> list[int]:
+        """DMA the slots' experts to staging and repack them, MAX_BATCH at a time. ``defer_last_repack``: the last
+        chunk stays in staging unrepacked and its slots are returned (the caller repacks before reading them)."""
+        writer = ttnn.copy_host_to_device_tensor_region
+        deferred: list[int] = []
+        for start in range(0, len(slots), self.MAX_BATCH):
+            chunk = list(slots[start : start + self.MAX_BATCH])
+            last = start + self.MAX_BATCH >= len(slots)
+            repack_now = not (defer_last_repack and last)
+            if repack_now and cq_id:
+                raise ValueError("loads on another command queue repack in the caller: one chunk, deferred")
+            if repack_now:
+                self._write_params(chunk)  # one params write for both pools (same slots)
+            else:
+                deferred = chunk
+            for pool, store in (
+                (pool_owner.gate_up, pool_owner.store.gate_up),
+                (pool_owner.down, pool_owner.store.down),
+            ):
+                staging, tiles, pages = self._staging(pool)
+                page_bytes = staging.buffer_page_size()
+                hosts = [store[pool_owner.expert_in[slot]] for slot in chunk]
+                offsets = [i * pages * page_bytes for i in range(len(chunk))]
+                batch_writer = _regions_writer()
+                if batch_writer is not None:  # every missing expert of the layer in one queue submission
+                    batch_writer(hosts, staging, offsets, cq_id=ttnn.QueueId(cq_id), pin=True, raw_bytes=True)
+                else:
+                    for host, offset in zip(hosts, offsets):
+                        writer(host, staging, offset, pin=True, raw_bytes=True)
+                if repack_now:
+                    self._repack(staging, pool, tiles)
+        return deferred

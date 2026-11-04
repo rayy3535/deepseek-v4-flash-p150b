@@ -63,6 +63,9 @@ models/autoports/deepseek_ai_deepseek_v4_flash_0731/vllm_models/run_server_p150b
 - The first start builds the packed expert cache (`DEEPSEEK_V4_FLASH_EXPERT_CACHE`, default
   `~/.cache/deepseek_v4_flash/experts_bfp4`, about 156 GB) and takes much longer; later starts take a few minutes
   (about 3 of them compiling the short-prompt prefill programs).
+- Expert loads read pinned host memory directly, which needs the cards' IOMMU groups in DMA mode (`iommu=pt` puts
+  them in identity mode; switch each group's `type` to `DMA-FQ` in sysfs after unbinding the device, or boot without
+  `iommu=pt`). Without it the loads still work, through the command queue. Startup pins every expert once (~20 s).
 - The server listens on `127.0.0.1:8010` and serves `deepseek-ai/DeepSeek-V4-Flash-0731`. Thinking is controlled by
   `chat_template_kwargs: {"thinking": true}`.
 - Only device sampling is supported: requests with `logprobs`, `min_tokens`, structured outputs (including a forced
@@ -114,6 +117,7 @@ nothing needs to be set; `run_server_p150b_x4.sh` only sets `DEEPSEEK_V4_FLASH_S
 | `DEEPSEEK_V4_FLASH_EXPERT_CACHE` | `~/.cache/deepseek_v4_flash/experts_bfp4` | packed expert cache directory; empty disables it |
 | `DEEPSEEK_V4_FLASH_ATTENTION_DTYPE` | `bfp8` | attention projection weights (`bfp4` saves 1.36 GiB per device) |
 | `DEEPSEEK_V4_FLASH_SHARED_DTYPE` | `bfp8` | shared-expert weights (`bfp4` saves 0.13 GiB per device) |
+| `DEEPSEEK_V4_FLASH_LARGE_PAGE_LOADS` | `1` | expert loads as pinned large pages + on-device repack (bitwise); `0` = one write per tile |
 | `DEEPSEEK_V4_FLASH_SESSION_REUSE` | `1` | resume a prompt that extends the previous one from a ring snapshot (bitwise) |
 | `DEEPSEEK_V4_FLASH_PERSISTENT_TRACES` | `1` | keep decode / verify traces across requests (bitwise) |
 | `DEEPSEEK_V4_FLASH_MHC_A2` | `1` | fused mHC input-map epilogue with 20 Sinkhorn iterations |

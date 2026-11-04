@@ -19,9 +19,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from loguru import logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 import ttnn
+from models.autoports.deepseek_ai_deepseek_v4_flash_0731.tt.expert_pool import ExpertPool, _LargePageLoader
 from models.autoports.deepseek_ai_deepseek_v4_flash_0731.tt.generator import Generator
 from models.autoports.deepseek_ai_deepseek_v4_flash_0731.tt.model import (
     FULL_LAYER_INDICES,
@@ -48,6 +50,10 @@ EXPERT_CACHE_ENV = "DEEPSEEK_V4_FLASH_EXPERT_CACHE"
 ATTENTION_DTYPE_ENV = "DEEPSEEK_V4_FLASH_ATTENTION_DTYPE"
 # Shared-expert weights: bfp8 (default, the checkpoint's FP8 precision) or bfp4.
 SHARED_DTYPE_ENV = "DEEPSEEK_V4_FLASH_SHARED_DTYPE"
+# Expert loads as large pages: each missing expert's packed tiles are DMA'd from pinned host memory into a staging
+# buffer and moved into their pool slots on the device (default 1; needs the IOMMU in DMA mode for pinning, else the
+# bytes go through the command queue). Every expert is pinned once at startup.
+LARGE_PAGE_LOADS_ENV = "DEEPSEEK_V4_FLASH_LARGE_PAGE_LOADS"
 # Log expert-pool hit rate after every prefill and every N decode steps; unset or 0 means off.
 POOL_STATS_ENV = "DEEPSEEK_V4_FLASH_POOL_STATS"
 # Streaming prefill block in tokens: 128 (fork default) up to 512, a multiple of 128.
@@ -148,6 +154,25 @@ def _deployment() -> tuple[str, dict[str, Any]]:
     if cache:
         paging["expert_cache_dir"] = Path(cache).expanduser()
     return QUIETBOX2_PAGED_BFP4_POLICY, paging
+
+
+def _prepin_expert_pools(mesh_device: Any, model: Any, drafter: Any) -> None:
+    """Pin every expert's host bytes once (large-page loads), so no load pays the first-touch pin."""
+
+    started = time.perf_counter()
+    pools = []
+    for owner in (model, drafter):
+        for layer in getattr(owner, "layers", None) or ():
+            pool = getattr(getattr(layer, "moe", None), "pool", None)
+            if pool is not None and all(pool is not seen for seen in pools):
+                pools.append(pool)
+    loader = _LargePageLoader.get(mesh_device)
+    for pool in pools:
+        loader.prepin(pool)
+    ttnn.synchronize_device(mesh_device)
+    logger.info(
+        "large-page expert loads: pinned {} expert pools in {:.1f} s", len(pools), time.perf_counter() - started
+    )
 
 
 def _spec_setting() -> tuple[str, int] | None:
@@ -447,6 +472,8 @@ class DeepseekV4ForCausalLM:
         prefill_hc = os.environ.get(PREFILL_HC_ENV, "").strip()
         if prefill_hc:
             MultichipDecoder.prefill_hc_fused = MultichipDecoder.prefill_hc_post_kernel = prefill_hc == "1"
+        large_pages = os.environ.get(LARGE_PAGE_LOADS_ENV, "1").strip() == "1"
+        ExpertPool.large_page_loads = large_pages
         model = DeepSeekV4FlashModel.from_checkpoint(
             _checkpoint_path(hf_config),
             mesh_device,
@@ -483,6 +510,8 @@ class DeepseekV4ForCausalLM:
             # The decode trace writes its position's context itself (last segment, before the position advances).
             model.decode_tap_hook = drafter.write_context
             drafter.register_rings()  # before the persistent ring snapshot is allocated
+        if large_pages:
+            _prepin_expert_pools(mesh_device, model, drafter)
         return cls(model, drafter)
 
     @property

@@ -18,6 +18,9 @@ export PYTHONPATH="$TT_METAL_ROOT/build_Release"
 export EXTRA_MODELS_DIR="$TT_METAL_ROOT/models/autoports/deepseek_ai_deepseek_v4_flash_0731/vllm_models"
 export VLLM_PLUGINS=tt,tt_model_registry
 export DEEPSEEK_V4_FLASH_HF_MODEL="$DEEPSEEK_MODEL"
+# Large-page expert loads pin every routed expert's host bytes once (~156 GB with the BFP4 cache): the pin cache must
+# hold them all (default 4 GiB).
+export TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=${TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES:-214748364800}
 unset TT_MESH_GRAPH_DESC_PATH  # let tt-metal discover the 4-card ring
 
 # Speculative decoding: dspark:<K> (the checkpoint's DSpark drafter on device), ngram:<K>, or empty for plain decode.
