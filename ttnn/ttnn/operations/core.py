@@ -587,6 +587,10 @@ ttnn.register_python_operation(
     doc=ttnn._ttnn.operations.core.copy_host_to_device_tensor_region.__doc__,
 )(ttnn._ttnn.operations.core.copy_host_to_device_tensor_region)
 ttnn.register_python_operation(
+    name="ttnn.copy_host_to_device_tensor_regions",
+    doc=ttnn._ttnn.operations.core.copy_host_to_device_tensor_regions.__doc__,
+)(ttnn._ttnn.operations.core.copy_host_to_device_tensor_regions)
+ttnn.register_python_operation(
     name="ttnn.copy_device_to_host_tensor",
 )(ttnn._ttnn.operations.core.copy_device_to_host_tensor)
 ttnn.attach_golden_function(

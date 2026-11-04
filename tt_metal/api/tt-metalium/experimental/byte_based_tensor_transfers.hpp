@@ -39,12 +39,24 @@ void enqueue_write_tensor(
 // Writes every shard of a (possibly multi-device) host tensor into the same byte range of the matching
 // device shard: [offset, offset + host shard size). The offset must be page aligned and the range must lie
 // inside the device buffer. Fast dispatch only. Lets a host-paged weight pool fill one slot of a larger
-// device tensor without rewriting the rest of it.
+// device tensor without rewriting the rest of it. pin: pin each host shard (cached) so the device reads it
+// directly from host memory (IOMMU in DMA mode; otherwise the regular copy path).
 void enqueue_write_tensor_region(
     distributed::MeshCommandQueue& queue,
     const HostTensor& host_tensor,
     const MeshTensor& device_tensor,
     std::size_t offset,
-    bool blocking = false);
+    bool blocking = false,
+    bool pin = false);
+
+// Several region writes into one device tensor in a single queue submission: host_tensors[i] goes to
+// [offsets[i], offsets[i] + shard size) of every device shard (same rules as enqueue_write_tensor_region).
+void enqueue_write_tensor_regions(
+    distributed::MeshCommandQueue& queue,
+    const std::vector<HostTensor>& host_tensors,
+    const MeshTensor& device_tensor,
+    const std::vector<std::size_t>& offsets,
+    bool blocking = false,
+    bool pin = false);
 
 }  // namespace tt::tt_metal

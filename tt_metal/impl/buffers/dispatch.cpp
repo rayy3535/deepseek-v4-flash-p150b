@@ -1190,7 +1190,9 @@ bool write_to_device_buffer(
             const uint8_t* src_ptr = static_cast<const uint8_t*>(src);
             const uint64_t pinned_size = pinned_memory->get_buffer_size();
             auto region = buffer.impl().root_buffer_region();
-            const uint8_t* src_region_start = src_ptr + region.offset;
+            // src holds the region's own bytes (as on the copy path, which reads it from offset 0), so the pinned
+            // read starts at src, not at src + region.offset.
+            const uint8_t* src_region_start = src_ptr;
             const uint8_t* src_region_end = src_region_start + region.size;
             // Check against L1 alignment because we need the copy from the prefetcher to the dispatcher to be aligned.
             const uint32_t pinned_src_alignment = hal.get_read_alignment(HalMemType::L1);

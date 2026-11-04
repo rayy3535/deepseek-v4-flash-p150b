@@ -365,25 +365,69 @@ void py_module(nb::module_& mod) {
         )doc");
 
     mod.def(
+        "copy_host_to_device_tensor_regions",
+        [](const std::vector<ttnn::Tensor>& host_tensors,
+           ttnn::Tensor& device_tensor,
+           const std::vector<std::size_t>& offsets_bytes,
+           const std::optional<QueueId>& cq_id,
+           bool pin,
+           bool raw_bytes) {
+            TT_FATAL(device_tensor.storage_type() == StorageType::DEVICE, "the target must be a device tensor");
+            std::vector<tt::tt_metal::HostTensor> hosts;
+            hosts.reserve(host_tensors.size());
+            for (const auto& host_tensor : host_tensors) {
+                TT_FATAL(host_tensor.storage_type() == StorageType::HOST, "sources must be host tensors");
+                TT_FATAL(
+                    raw_bytes || (host_tensor.dtype() == device_tensor.dtype() &&
+                                  host_tensor.layout() == device_tensor.layout()),
+                    "host and device tensors must have the same dtype and layout");
+                hosts.push_back(host_tensor.host_tensor());
+            }
+            auto& cq = device_tensor.device()->mesh_command_queue(raw_optional(cq_id));
+            tt::tt_metal::enqueue_write_tensor_regions(
+                cq, hosts, device_tensor.device_storage().get_mesh_tensor(), offsets_bytes, /*blocking=*/false, pin);
+        },
+        nb::arg("host_tensors"),
+        nb::arg("device_tensor"),
+        nb::arg("offsets_bytes"),
+        nb::arg("cq_id") = nb::none(),
+        nb::arg("pin") = false,
+        nb::arg("raw_bytes") = false,
+        R"doc(
+        copy_host_to_device_tensor_region for several host tensors into one device tensor in a single queue
+        submission (host_tensors[i] at offsets_bytes[i]).
+        )doc");
+
+    mod.def(
         "copy_host_to_device_tensor_region",
         [](const ttnn::Tensor& host_tensor,
            ttnn::Tensor& device_tensor,
            std::size_t offset_bytes,
-           const std::optional<QueueId>& cq_id) {
+           const std::optional<QueueId>& cq_id,
+           bool pin,
+           bool raw_bytes) {
             TT_FATAL(
                 host_tensor.storage_type() == StorageType::HOST && device_tensor.storage_type() == StorageType::DEVICE,
                 "copy_host_to_device_tensor_region copies a host tensor into a device tensor");
             TT_FATAL(
-                host_tensor.dtype() == device_tensor.dtype() && host_tensor.layout() == device_tensor.layout(),
+                raw_bytes ||
+                    (host_tensor.dtype() == device_tensor.dtype() && host_tensor.layout() == device_tensor.layout()),
                 "host and device tensors must have the same dtype and layout");
             auto& cq = device_tensor.device()->mesh_command_queue(raw_optional(cq_id));
             tt::tt_metal::enqueue_write_tensor_region(
-                cq, host_tensor.host_tensor(), device_tensor.device_storage().get_mesh_tensor(), offset_bytes);
+                cq,
+                host_tensor.host_tensor(),
+                device_tensor.device_storage().get_mesh_tensor(),
+                offset_bytes,
+                /*blocking=*/false,
+                pin);
         },
         nb::arg("host_tensor"),
         nb::arg("device_tensor"),
         nb::arg("offset_bytes"),
         nb::arg("cq_id") = nb::none(),
+        nb::arg("pin") = false,
+        nb::arg("raw_bytes") = false,
         R"doc(
         Writes each shard of a host tensor into the byte range [offset_bytes, offset_bytes + shard size) of the
         matching shard of a pre-allocated device tensor, leaving the rest of the device tensor unchanged.
@@ -392,6 +436,10 @@ void py_module(nb::module_& mod) {
         packed tiles), and ``offset_bytes`` must be a multiple of the device buffer's page size. Typical use:
         fill one slot ``[0, s]`` of a ``[1, S, K, N]`` interleaved TILE tensor from a ``[1, 1, K, N]`` host
         tensor at ``offset_bytes = s * (K // 32) * (N // 32) * tile_bytes``. Fast dispatch only.
+
+        ``pin=True`` pins each host shard once (cached) so the device reads it directly from host memory when the
+        IOMMU is in DMA mode. ``raw_bytes=True`` copies the host shard's bytes as they are into a device tensor of a
+        different dtype / layout (for example packed tiles into a large-page staging buffer).
         )doc");
 
     mod.def(

@@ -1187,6 +1187,11 @@ bool MeshDeviceImpl::close_impl(MeshDevice* pimpl_wrapper) {
             device->set_smc_dispatch_telemetry_slow_dispatch_enabled(false);
         }
 
+        // Release cached pinned-memory entries while the command queues still exist: releasing an entry drains
+        // its barrier events, which synchronizes on these queues. The later release below is then a no-op.
+        if (metal_env().get_cluster().get_target_device_type() != tt::TargetDevice::Mock) {
+            experimental::PinnedMemoryCache::instance().release_for_device(*pimpl_wrapper);
+        }
         mesh_command_queues_.clear();
     }
 
@@ -1234,20 +1239,20 @@ bool MeshDeviceImpl::close_impl(MeshDevice* pimpl_wrapper) {
         // still initialized runs mesh-buffer deallocation during teardown, which hangs on multihost
         // meshes using the hybrid allocator. Cached programs outliving the persistent L1 arena is
         // handled by PersistentL1Arena::Seal's liveness token instead.
+        // Release cached pinned-memory entries while MetalContext is still alive
+        // (needs the cluster to map chip -> MMIO IDs) and while the command queues still exist: releasing an
+        // entry drains its barrier events, which queries the queues of its devices. Must run before
+        // destroy_instance below, and only on the first close_impl call.
+        // Skip for mock devices — they never create pinned DMA regions.
+        if (metal_env().get_cluster().get_target_device_type() != tt::TargetDevice::Mock) {
+            experimental::PinnedMemoryCache::instance().release_for_device(*pimpl_wrapper);
+        }
         sub_device_manager_tracker_.reset();
         scoped_devices_.reset();
         parent_mesh_.reset();
         is_internal_state_initialized = false;
         if (distributed_context_) {
             distributed_context_.reset();
-        }
-
-        // Release cached pinned-memory entries while MetalContext is still alive
-        // (needs the cluster to map chip -> MMIO IDs). Must run before
-        // destroy_instance below, and only on the first close_impl call.
-        // Skip for mock devices — they never create pinned DMA regions.
-        if (metal_env().get_cluster().get_target_device_type() != tt::TargetDevice::Mock) {
-            experimental::PinnedMemoryCache::instance().release_for_device(*pimpl_wrapper);
         }
     }
 
